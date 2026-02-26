@@ -607,4 +607,3 @@ client.on(Events.InteractionCreate, async function(i) {
     const id = new TextInputBuilder()
       .setCustomId('desc').setLabel('Descricao')
       .setStyle(TextInputStyle.Short).setRequired(false)
-  
