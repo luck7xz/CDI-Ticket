@@ -1,5 +1,5 @@
 {
-  "name": "ticket-bot",
+  "name": "economy-bot",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -12,4 +12,3 @@
     "discord.js": "^14.14.1"
   }
 }
-
