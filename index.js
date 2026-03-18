@@ -2,411 +2,422 @@ const {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-  Events,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
-  StringSelectMenuBuilder,
-  PermissionFlagsBits,
-  ChannelType,
-  AttachmentBuilder
+  PermissionFlagsBits
 } = require('discord.js');
-
-const {
-  handleOpcoes,
-  handleModals,
-  handleSelOp,
-  menuPrincipal,
-  menuConfig,
-  menuOpcoes,
-  montarEmbed
-} = require('./handlers');
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers
   ]
 });
 
-const CARGO = '1474839295989780622';
-const paineis = new Map();
-const tickets = new Map();
-const contadores = new Map();
-const sessoes = new Map();
+const PREFIX = '$';
+const ADMINS = ['1280969207042801755', '1457424883645550815'];
 
-function temPerm(member) {
-  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-  if (member.roles.cache.has(CARGO)) return true;
-  return false;
+// guildId -> userId -> { carteira, banco }
+const economia = new Map();
+// cooldowns: userId -> { trabalho, roubo, preso }
+const cooldowns = new Map();
+
+// Config global (admins podem editar)
+const config = {
+  chanceRoubo: 45,        // % de chance de roubo dar certo
+  multTrabalhoMin: 50,
+  multTrabalhoMax: 200,
+  multRouboMin: 10,
+  multRouboMax: 50,
+  cdTrabalho: 30,         // minutos
+  cdRoubo: 60,            // minutos
+  cdPreso: 10,            // minutos preso se falhar roubo
+  salarioInicial: 100
+};
+
+function getSaldo(gid, uid) {
+  if (!economia.has(gid)) economia.set(gid, new Map());
+  const g = economia.get(gid);
+  if (!g.has(uid)) g.set(uid, { carteira: 0, banco: 0 });
+  return g.get(uid);
 }
 
-function getPaineis(gid) {
-  if (!paineis.has(gid)) paineis.set(gid, new Map());
-  return paineis.get(gid);
+function setSaldo(gid, uid, dados) {
+  if (!economia.has(gid)) economia.set(gid, new Map());
+  economia.get(gid).set(uid, dados);
 }
 
-function getNum(gid) {
-  const n = (contadores.get(gid) || 0) + 1;
-  contadores.set(gid, n);
-  return String(n).padStart(4, '0');
+function getCd(uid) {
+  if (!cooldowns.has(uid)) cooldowns.set(uid, {});
+  return cooldowns.get(uid);
 }
 
-function novaSessao() {
-  return {
-    titulo: 'Suporte',
-    descricao: 'Selecione uma opcao para abrir seu ticket.',
-    cor: '#2b2d31',
-    autor: null,
-    imagem: null,
-    thumbnail: null,
-    rodape: null,
-    mensagem: 'Selecione o tipo de atendimento:',
-    opcoes: [],
-    categoriaId: null,
-    logsId: null,
-    cargoId: null
-  };
+function temCd(uid, tipo) {
+  const cd = getCd(uid);
+  if (!cd[tipo]) return 0;
+  const restante = cd[tipo] - Date.now();
+  return restante > 0 ? restante : 0;
 }
 
-function montarSelect(s, pid) {
-  if (!s.opcoes || !s.opcoes.length) return null;
-  const opts = s.opcoes.map(function(op, i) {
-    const o = { label: op.label, value: String(i) };
-    if (op.desc) o.description = op.desc;
-    if (op.emoji) o.emoji = op.emoji;
-    return o;
-  });
-  const sel = new StringSelectMenuBuilder()
-    .setCustomId('abrir_' + pid)
-    .setPlaceholder(s.mensagem)
-    .addOptions(opts);
-  return new ActionRowBuilder().addComponents(sel);
+function setCd(uid, tipo, minutos) {
+  const cd = getCd(uid);
+  cd[tipo] = Date.now() + minutos * 60 * 1000;
 }
 
-async function gerarTranscript(channel, td) {
-  let msgs = [];
-  try {
-    const f = await channel.messages.fetch({ limit: 100 });
-    msgs = Array.from(f.values()).reverse();
-  } catch (_) {}
-  const linhas = msgs.map(function(m) {
-    const t = new Date(m.createdTimestamp).toLocaleString('pt-BR');
-    const c = (m.content || '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
-    return '<div class="m"><span class="t">' + t
-      + '</span> <span class="a">' + m.author.tag
-      + '</span>: ' + c + '</div>';
-  }).join('\n');
-  return '<!DOCTYPE html><html><head><meta charset="UTF-8">'
-    + '<title>Transcript</title><style>'
-    + 'body{background:#36393f;color:#dcddde;font-family:sans-serif;padding:20px}'
-    + 'h1{color:#fff}.info{background:#2f3136;padding:10px;border-radius:8px;margin-bottom:20px}'
-    + '.m{padding:4px 0;border-bottom:1px solid #2f3136;font-size:14px}'
-    + '.t{color:#72767d;font-size:12px}.a{font-weight:bold;color:#7289da}'
-    + '</style></head><body><h1>Transcript</h1>'
-    + '<div class="info">'
-    + '<b>Canal:</b> #' + channel.name + '<br>'
-    + '<b>Aberto por:</b> ' + (td.abrirPor || '?') + '<br>'
-    + '<b>Tipo:</b> ' + (td.tipo || 'Geral') + '<br>'
-    + '<b>Fechado:</b> ' + new Date().toLocaleString('pt-BR')
-    + '</div>' + linhas + '</body></html>';
+function formatMs(ms) {
+  const min = Math.floor(ms / 60000);
+  const sec = Math.floor((ms % 60000) / 1000);
+  if (min > 0) return min + 'm ' + sec + 's';
+  return sec + 's';
 }
 
-client.once(Events.ClientReady, async function(c) {
+function rand(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function isAdmin(uid) {
+  return ADMINS.includes(uid);
+}
+
+function embedBase(titulo, cor) {
+  return new EmbedBuilder().setTitle(titulo).setColor(cor || '#2b2d31').setTimestamp();
+}
+
+client.once('ready', function(c) {
   console.log('Online: ' + c.user.tag);
-  const cmds = [
-    new SlashCommandBuilder()
-      .setName('ticket')
-      .setDescription('Gerencia paineis de ticket')
-  ].map(function(x) { return x.toJSON(); });
-  try {
-    await new REST({ version: '10' })
-      .setToken(process.env.TOKEN)
-      .put(Routes.applicationCommands(c.user.id), { body: cmds });
-    console.log('Comandos registrados.');
-  } catch (e) {
-    console.error(e);
-  }
 });
 
-client.on(Events.InteractionCreate, async function(i) {
+client.on('messageCreate', async function(msg) {
+  if (msg.author.bot) return;
+  if (!msg.content.startsWith(PREFIX)) return;
+  if (!msg.guild) return;
 
-  if (i.isChatInputCommand() && i.commandName === 'ticket') {
-    if (!temPerm(i.member)) {
-      return i.reply({ content: 'Sem permissao!', ephemeral: true });
-    }
-    return i.reply({
-      content: '## Gerenciador de Tickets',
-      components: [menuPrincipal()],
-      ephemeral: true
-    });
+  const args = msg.content.slice(PREFIX.length).trim().split(/ +/);
+  const cmd = args.shift().toLowerCase();
+  const gid = msg.guild.id;
+  const uid = msg.author.id;
+
+  // SALDO
+  if (cmd === 'saldo' || cmd === 'bal') {
+    const alvo = msg.mentions.users.first();
+    const tid = alvo ? alvo.id : uid;
+    const tnome = alvo ? alvo.username : msg.author.username;
+    const s = getSaldo(gid, tid);
+    const e = embedBase('💰 Saldo de ' + tnome, '#f1c40f');
+    e.addFields(
+      { name: '👛 Carteira', value: '🪙 ' + s.carteira, inline: true },
+      { name: '🏦 Banco', value: '🪙 ' + s.banco, inline: true },
+      { name: '💎 Total', value: '🪙 ' + (s.carteira + s.banco), inline: true }
+    );
+    return msg.reply({ embeds: [e] });
   }
 
-  if (i.isButton() && i.customId.startsWith('fechar_')) {
-    const chId = i.channel.id;
-    const td = tickets.get(chId);
-    const podeFechar = temPerm(i.member) || (td && i.user.id === td.abrirPorId);
-    if (!podeFechar) {
-      return i.reply({ content: 'Sem permissao.', ephemeral: true });
-    }
-    await i.reply({ content: 'Fechando ticket...' });
-    try {
-      const html = await gerarTranscript(i.channel, td || {});
-      const buf = Buffer.from(html, 'utf-8');
-      const nome = 'transcript-' + i.channel.name + '.html';
-      const att = new AttachmentBuilder(buf, { name: nome });
-      if (td && td.logsId) {
-        const lch = i.guild.channels.cache.get(td.logsId);
-        if (lch) {
-          const le = new EmbedBuilder()
-            .setTitle('Ticket Fechado').setColor('#ff4444')
-            .addFields(
-              { name: 'Canal', value: '#' + i.channel.name, inline: true },
-              { name: 'Aberto por', value: td.abrirPor || '?', inline: true },
-              { name: 'Tipo', value: td.tipo || 'Geral', inline: true },
-              { name: 'Fechado por', value: i.user.tag, inline: true }
-            ).setTimestamp();
-          await lch.send({ embeds: [le], files: [att] });
-        }
-      }
-      tickets.delete(chId);
-      await i.channel.delete();
-    } catch (e) { console.error(e); }
-    return;
+  // DEPOSITAR
+  if (cmd === 'dep' || cmd === 'depositar') {
+    const s = getSaldo(gid, uid);
+    const qtd = args[0] === 'tudo' ? s.carteira : parseInt(args[0]);
+    if (!qtd || qtd <= 0) return msg.reply('Use: `$dep <valor>` ou `$dep tudo`');
+    if (qtd > s.carteira) return msg.reply('Você não tem esse valor na carteira!');
+    s.carteira -= qtd;
+    s.banco += qtd;
+    setSaldo(gid, uid, s);
+    const e = embedBase('🏦 Depósito', '#2ecc71');
+    e.setDescription('Depositado **🪙 ' + qtd + '** no banco!\nSaldo banco: 🪙 ' + s.banco);
+    return msg.reply({ embeds: [e] });
   }
 
-  if (!i.isStringSelectMenu() && !i.isModalSubmit()) return;
-
-  if (i.isModalSubmit()) return handleModals(i, sessoes);
-
-  if (i.customId.startsWith('abrir_')) {
-    const pid = i.customId.replace('abrir_', '');
-    const painel = getPaineis(i.guild.id).get(pid);
-    if (!painel) {
-      return i.reply({ content: 'Painel nao encontrado.', ephemeral: true });
-    }
-    const jaAberto = Array.from(tickets.values()).find(function(t) {
-      return t.abrirPorId === i.user.id && t.guildId === i.guild.id;
-    });
-    if (jaAberto) {
-      return i.reply({
-        content: 'Voce ja tem um ticket! <#' + jaAberto.channelId + '>',
-        ephemeral: true
-      });
-    }
-    await i.deferReply({ ephemeral: true });
-    try {
-      const opcao = painel.opcoes[parseInt(i.values[0])];
-      const num = getNum(i.guild.id);
-      const nome = i.user.username.toLowerCase().replace(/[^a-z0-9]/g, '') + '-' + num;
-      const perms = [
-        { id: i.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-        {
-          id: i.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory
-          ]
-        },
-        {
-          id: client.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ManageChannels,
-            PermissionFlagsBits.ReadMessageHistory
-          ]
-        }
-      ];
-      if (painel.cargoId) {
-        perms.push({
-          id: painel.cargoId,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory
-          ]
-        });
-      }
-      const copts = {
-        name: nome,
-        type: ChannelType.GuildText,
-        permissionOverwrites: perms
-      };
-      if (painel.categoriaId) copts.parent = painel.categoriaId;
-      const ch = await i.guild.channels.create(copts);
-      let desc = 'Ola ' + i.user.toString() + '!\n';
-      desc += 'Aguarde a equipe responsavel lhe atender.';
-      if (painel.cargoId) desc += '\n\n<@&' + painel.cargoId + '>';
-      const te = new EmbedBuilder()
-        .setTitle('Ticket #' + num + ' - ' + (opcao ? opcao.label : 'Suporte'))
-        .setDescription(desc)
-        .setFooter({ text: 'Aberto por ' + i.user.tag })
-        .setTimestamp();
-      try { if (painel.cor) te.setColor(painel.cor); } catch (_) {}
-      const fb = new ButtonBuilder()
-        .setCustomId('fechar_' + ch.id)
-        .setLabel('Fechar Ticket')
-        .setStyle(ButtonStyle.Danger);
-      await ch.send({
-        embeds: [te],
-        components: [new ActionRowBuilder().addComponents(fb)]
-      });
-      tickets.set(ch.id, {
-        channelId: ch.id,
-        guildId: i.guild.id,
-        abrirPorId: i.user.id,
-        abrirPor: i.user.tag,
-        tipo: opcao ? opcao.label : 'Geral',
-        logsId: painel.logsId
-      });
-      return i.editReply({ content: 'Ticket aberto! ' + ch.toString() });
-    } catch (e) {
-      console.error(e);
-      return i.editReply({ content: 'Erro ao criar ticket.' });
-    }
+  // SACAR
+  if (cmd === 'sac' || cmd === 'sacar') {
+    const s = getSaldo(gid, uid);
+    const qtd = args[0] === 'tudo' ? s.banco : parseInt(args[0]);
+    if (!qtd || qtd <= 0) return msg.reply('Use: `$sac <valor>` ou `$sac tudo`');
+    if (qtd > s.banco) return msg.reply('Você não tem esse valor no banco!');
+    s.banco -= qtd;
+    s.carteira += qtd;
+    setSaldo(gid, uid, s);
+    const e = embedBase('💵 Saque', '#2ecc71');
+    e.setDescription('Sacado **🪙 ' + qtd + '** do banco!\nSaldo carteira: 🪙 ' + s.carteira);
+    return msg.reply({ embeds: [e] });
   }
 
-  if (i.customId === 't_principal') {
-    const v = i.values[0];
-    const gp = getPaineis(i.guild.id);
-    if (v === 'criar') {
-      const s = novaSessao();
-      sessoes.set(i.user.id, { s: s, id: null });
-      return i.update({
-        content: '## Criando Painel',
-        embeds: [montarEmbed(s)],
-        components: [menuConfig()]
-      });
+  // TRANSFERIR
+  if (cmd === 'pagar' || cmd === 'pay') {
+    const alvo = msg.mentions.members.first();
+    if (!alvo) return msg.reply('Use: `$pagar @user <valor>`');
+    const qtd = parseInt(args[1]);
+    if (!qtd || qtd <= 0) return msg.reply('Valor inválido!');
+    const s = getSaldo(gid, uid);
+    if (qtd > s.carteira) return msg.reply('Sem saldo na carteira!');
+    const sa = getSaldo(gid, alvo.id);
+    s.carteira -= qtd;
+    sa.carteira += qtd;
+    setSaldo(gid, uid, s);
+    setSaldo(gid, alvo.id, sa);
+    const e = embedBase('💸 Transferência', '#3498db');
+    e.setDescription('Você enviou **🪙 ' + qtd + '** para ' + alvo.toString());
+    return msg.reply({ embeds: [e] });
+  }
+
+  // TRABALHAR
+  if (cmd === 'trabalhar' || cmd === 'work') {
+    const restante = temCd(uid, 'trabalho');
+    if (restante > 0) {
+      return msg.reply('⏳ Aguarde **' + formatMs(restante) + '** para trabalhar novamente!');
     }
-    if (v === 'editar' || v === 'excluir') {
-      if (gp.size === 0) {
-        return i.reply({ content: 'Nenhum painel salvo.', ephemeral: true });
-      }
-      const opts = Array.from(gp.entries()).map(function(e) {
-        return { label: e[1].titulo || 'Sem titulo', value: e[0] };
-      });
-      const cid = v === 'editar' ? 't_sel_editar' : 't_sel_excluir';
-      const sel = new StringSelectMenuBuilder()
-        .setCustomId(cid).setPlaceholder('Selecione o painel').addOptions(opts);
-      return i.update({
-        content: v === 'editar' ? '## Editar' : '## Excluir',
-        embeds: [],
-        components: [new ActionRowBuilder().addComponents(sel)]
-      });
+    if (temCd(uid, 'preso') > 0) {
+      return msg.reply('🔒 Você está preso! Aguarde **' + formatMs(temCd(uid, 'preso')) + '**');
+    }
+    const ganho = rand(config.multTrabalhoMin, config.multTrabalhoMax);
+    const s = getSaldo(gid, uid);
+    s.carteira += ganho;
+    setSaldo(gid, uid, s);
+    setCd(uid, 'trabalho', config.cdTrabalho);
+    const trabalhos = [
+      'Você fez hora extra na fábrica',
+      'Você deu aula de reforço',
+      'Você entregou pizzas',
+      'Você lavou carros',
+      'Você fez bico de motorista',
+      'Você vendeu salgados',
+      'Você trabalhou no mercado'
+    ];
+    const t = trabalhos[rand(0, trabalhos.length - 1)];
+    const e = embedBase('💼 Trabalho', '#2ecc71');
+    e.setDescription(t + ' e ganhou **🪙 ' + ganho + '**!\nCarteira: 🪙 ' + s.carteira);
+    return msg.reply({ embeds: [e] });
+  }
+
+  // ROUBAR
+  if (cmd === 'roubar' || cmd === 'rob') {
+    const alvo = msg.mentions.members.first();
+    if (!alvo) return msg.reply('Use: `$roubar @user`');
+    if (alvo.id === uid) return msg.reply('Você não pode se roubar!');
+    const restante = temCd(uid, 'roubo');
+    if (restante > 0) return msg.reply('⏳ Aguarde **' + formatMs(restante) + '** para roubar!');
+    const presoCd = temCd(uid, 'preso');
+    if (presoCd > 0) return msg.reply('🔒 Você está preso! Aguarde **' + formatMs(presoCd) + '**');
+    const salvo = getSaldo(gid, alvo.id);
+    if (salvo.carteira <= 0) return msg.reply('Essa pessoa não tem dinheiro na carteira!');
+    const sucesso = rand(1, 100) <= config.chanceRoubo;
+    setCd(uid, 'roubo', config.cdRoubo);
+    if (sucesso) {
+      const pct = rand(config.multRouboMin, config.multRouboMax);
+      const qtd = Math.max(1, Math.floor(salvo.carteira * pct / 100));
+      const sr = getSaldo(gid, uid);
+      salvo.carteira -= qtd;
+      sr.carteira += qtd;
+      setSaldo(gid, alvo.id, salvo);
+      setSaldo(gid, uid, sr);
+      const e = embedBase('🦹 Roubo bem-sucedido!', '#e74c3c');
+      e.setDescription('Você roubou **🪙 ' + qtd + '** de ' + alvo.toString() + '!');
+      return msg.reply({ embeds: [e] });
+    } else {
+      setCd(uid, 'preso', config.cdPreso);
+      const multa = Math.min(rand(20, 80), getSaldo(gid, uid).carteira);
+      const sm = getSaldo(gid, uid);
+      sm.carteira -= multa;
+      setSaldo(gid, uid, sm);
+      const e = embedBase('🚔 Você foi preso!', '#95a5a6');
+      const msg_preso = 'Você tentou roubar ' + alvo.toString() + ' mas foi pego!';
+      const msg_multa = 'Pagou **🪙 ' + multa + '** de multa e ficará preso por **' + config.cdPreso + ' min**.';
+      e.setDescription(msg_preso + '\n' + msg_multa);
+      return msg.reply({ embeds: [e] });
     }
   }
 
-  if (i.customId === 't_sel_editar') {
-    const p = getPaineis(i.guild.id).get(i.values[0]);
-    if (!p) return i.reply({ content: 'Nao encontrado.', ephemeral: true });
-    sessoes.set(i.user.id, {
-      s: Object.assign({}, p, { opcoes: p.opcoes.slice() }),
-      id: i.values[0]
-    });
-    return i.update({
-      content: '## Editando: ' + (p.titulo || '?'),
-      embeds: [montarEmbed(p)],
-      components: [menuConfig()]
-    });
+  // CARA OU COROA
+  if (cmd === 'coc' || cmd === 'coin') {
+    const s = getSaldo(gid, uid);
+    const qtd = args[1] === 'tudo' ? s.carteira : parseInt(args[1]);
+    const escolha = args[0] ? args[0].toLowerCase() : null;
+    if (!escolha || !['cara', 'coroa'].includes(escolha)) {
+      return msg.reply('Use: `$coc <cara/coroa> <valor>`');
+    }
+    if (!qtd || qtd <= 0) return msg.reply('Valor inválido!');
+    if (qtd > s.carteira) return msg.reply('Sem saldo na carteira!');
+    const resultado = rand(0, 1) === 0 ? 'cara' : 'coroa';
+    const ganhou = resultado === escolha;
+    if (ganhou) { s.carteira += qtd; } else { s.carteira -= qtd; }
+    setSaldo(gid, uid, s);
+    const e = embedBase('🪙 Cara ou Coroa', ganhou ? '#2ecc71' : '#e74c3c');
+    e.addFields(
+      { name: 'Resultado', value: resultado === 'cara' ? '👆 Cara' : '👇 Coroa', inline: true },
+      { name: 'Você escolheu', value: escolha === 'cara' ? '👆 Cara' : '👇 Coroa', inline: true },
+      { name: ganhou ? '✅ Ganhou!' : '❌ Perdeu!', value: '🪙 ' + (ganhou ? '+' : '-') + qtd, inline: true }
+    );
+    e.setFooter({ text: 'Carteira: 🪙 ' + s.carteira });
+    return msg.reply({ embeds: [e] });
   }
 
-  if (i.customId === 't_sel_excluir') {
-    const gp = getPaineis(i.guild.id);
-    const p = gp.get(i.values[0]);
-    if (!p) return i.reply({ content: 'Nao encontrado.', ephemeral: true });
-    gp.delete(i.values[0]);
-    return i.update({ content: 'Painel excluido!', embeds: [], components: [menuPrincipal()] });
+  // DADO
+  if (cmd === 'dado' || cmd === 'dice') {
+    const s = getSaldo(gid, uid);
+    const qtd = args[0] === 'tudo' ? s.carteira : parseInt(args[0]);
+    if (!qtd || qtd <= 0) return msg.reply('Use: `$dado <valor>`');
+    if (qtd > s.carteira) return msg.reply('Sem saldo na carteira!');
+    const meu = rand(1, 6);
+    const bot = rand(1, 6);
+    let ganhou = meu > bot;
+    let empate = meu === bot;
+    if (ganhou) { s.carteira += qtd; }
+    else if (!empate) { s.carteira -= qtd; }
+    setSaldo(gid, uid, s);
+    const e = embedBase('🎲 Jogo de Dado', ganhou ? '#2ecc71' : empate ? '#f1c40f' : '#e74c3c');
+    e.addFields(
+      { name: 'Seu dado', value: '🎲 ' + meu, inline: true },
+      { name: 'Bot', value: '🎲 ' + bot, inline: true },
+      { name: empate ? '🤝 Empate!' : ganhou ? '✅ Ganhou!' : '❌ Perdeu!',
+        value: empate ? 'Devolvido' : '🪙 ' + (ganhou ? '+' : '-') + qtd, inline: true }
+    );
+    e.setFooter({ text: 'Carteira: 🪙 ' + s.carteira });
+    return msg.reply({ embeds: [e] });
   }
 
-  if (i.customId === 't_config') {
-    const v = i.values[0];
-    const d = sessoes.get(i.user.id);
-    if (!d) return i.reply({ content: 'Sessao expirada.', ephemeral: true });
-    if (v === 'cancelar') {
-      sessoes.delete(i.user.id);
-      return i.update({ content: 'Cancelado.', embeds: [], components: [menuPrincipal()] });
+  // BLACKJACK
+  if (cmd === 'bj' || cmd === 'blackjack') {
+    const s = getSaldo(gid, uid);
+    const qtd = args[0] === 'tudo' ? s.carteira : parseInt(args[0]);
+    if (!qtd || qtd <= 0) return msg.reply('Use: `$bj <valor>`');
+    if (qtd > s.carteira) return msg.reply('Sem saldo na carteira!');
+    const cartas = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+    const naipes = ['♠','♥','♦','♣'];
+    function carta() { return cartas[rand(0,12)] + naipes[rand(0,3)]; }
+    function valor(c) {
+      const v = c.replace(/[♠♥♦♣]/g,'');
+      if (['J','Q','K'].includes(v)) return 10;
+      if (v === 'A') return 11;
+      return parseInt(v);
     }
-    if (v === 'opcoes') {
-      return i.update({ content: '## Opcoes', components: [menuOpcoes()] });
+    function total(mao) {
+      let t = mao.reduce(function(a,c){ return a + valor(c); }, 0);
+      let ases = mao.filter(function(c){ return c.startsWith('A'); }).length;
+      while (t > 21 && ases > 0) { t -= 10; ases--; }
+      return t;
     }
-    if (v === 'salvar') {
-      const gp = getPaineis(i.guild.id);
-      const pid = d.id || ('p_' + Date.now());
-      gp.set(pid, Object.assign({}, d.s));
-      sessoes.delete(i.user.id);
-      return i.update({ content: 'Painel salvo!', embeds: [], components: [menuPrincipal()] });
-    }
-    if (v === 'enviar') {
-      if (!d.s.opcoes.length) {
-        return i.reply({ content: 'Adicione opcoes antes de enviar.', ephemeral: true });
-      }
-      const gp = getPaineis(i.guild.id);
-      const pid = d.id || ('p_' + Date.now());
-      gp.set(pid, Object.assign({}, d.s));
-      const sel = montarSelect(d.s, pid);
-      try {
-        await i.channel.send({
-          embeds: [montarEmbed(d.s)],
-          components: sel ? [sel] : []
-        });
-        sessoes.delete(i.user.id);
-        return i.update({ content: 'Enviado!', embeds: [], components: [menuPrincipal()] });
-      } catch (e) {
-        return i.reply({ content: 'Erro ao enviar.', ephemeral: true });
-      }
-    }
-    if (v === 'geral') {
-      const i1 = new TextInputBuilder()
-        .setCustomId('cat').setLabel('ID da Categoria')
-        .setStyle(TextInputStyle.Short).setRequired(false)
-        .setValue(d.s.categoriaId || '');
-      const i2 = new TextInputBuilder()
-        .setCustomId('log').setLabel('ID Canal de Logs')
-        .setStyle(TextInputStyle.Short).setRequired(false)
-        .setValue(d.s.logsId || '');
-      const i3 = new TextInputBuilder()
-        .setCustomId('cargo').setLabel('ID do Cargo marcado')
-        .setStyle(TextInputStyle.Short).setRequired(false)
-        .setValue(d.s.cargoId || '');
-      const modal = new ModalBuilder()
-        .setCustomId('m_geral').setTitle('Config Gerais')
-        .addComponents(
-          new ActionRowBuilder().addComponents(i1),
-          new ActionRowBuilder().addComponents(i2),
-          new ActionRowBuilder().addComponents(i3)
-        );
-      return i.showModal(modal);
-    }
-    const lbls = {
-      titulo: 'Titulo', descricao: 'Descricao', cor: 'Cor (#hex)',
-      autor: 'Autor', imagem: 'Imagem URL', thumbnail: 'Thumbnail URL', rodape: 'Rodape'
-    };
-    const lbl = lbls[v] || v;
-    const inp = new TextInputBuilder()
-      .setCustomId('val').setLabel(lbl)
-      .setStyle(v === 'descricao' ? TextInputStyle.Paragraph : TextInputStyle.Short)
-      .setRequired(false).setValue(d.s[v] || '');
-    const modal = new ModalBuilder()
-      .setCustomId('m_campo_' + v).setTitle(lbl)
-      .addComponents(new ActionRowBuilder().addComponents(inp));
-    return i.showModal(modal);
+    const mjog = [carta(), carta()];
+    const mbot = [carta(), carta()];
+    const tj = total(mjog);
+    let tb = total(mbot);
+    while (tb < 17) { mbot.push(carta()); tb = total(mbot); }
+    let res;
+    if (tj > 21) res = 'perda';
+    else if (tb > 21) res = 'ganho';
+    else if (tj > tb) res = 'ganho';
+    else if (tj === tb) res = 'empate';
+    else res = 'perda';
+    if (res === 'ganho') s.carteira += qtd;
+    else if (res === 'perda') s.carteira -= qtd;
+    setSaldo(gid, uid, s);
+    const e = embedBase('🃏 Blackjack', res === 'ganho' ? '#2ecc71' : res === 'empate' ? '#f1c40f' : '#e74c3c');
+    e.addFields(
+      { name: 'Sua mão (' + tj + ')', value: mjog.join(' '), inline: true },
+      { name: 'Mão do bot (' + tb + ')', value: mbot.join(' '), inline: true },
+      { name: res === 'ganho' ? '✅ Ganhou!' : res === 'empate' ? '🤝 Empate!' : '❌ Perdeu!',
+        value: res === 'empate' ? 'Devolvido' : '🪙 ' + (res === 'ganho' ? '+' : '-') + qtd, inline: true }
+    );
+    e.setFooter({ text: 'Carteira: 🪙 ' + s.carteira });
+    return msg.reply({ embeds: [e] });
   }
 
-  if (i.customId === 't_opcoes') return handleOpcoes(i, sessoes);
-  if (i.customId === 't_sel_op_ed') return handleSelOp(i, sessoes);
-  if (i.customId === 't_sel_op_rm') return handleSelOp(i, sessoes);
+  // SLOT MACHINE
+  if (cmd === 'slot' || cmd === 'slots') {
+    const s = getSaldo(gid, uid);
+    const qtd = args[0] === 'tudo' ? s.carteira : parseInt(args[0]);
+    if (!qtd || qtd <= 0) return msg.reply('Use: `$slot <valor>`');
+    if (qtd > s.carteira) return msg.reply('Sem saldo na carteira!');
+    const simbolos = ['🍒','🍋','🍊','⭐','💎','7️⃣','🎰'];
+    const rodada = [
+      simbolos[rand(0,6)], simbolos[rand(0,6)], simbolos[rand(0,6)]
+    ];
+    let mult = 0;
+    if (rodada[0] === rodada[1] && rodada[1] === rodada[2]) {
+      if (rodada[0] === '💎') mult = 10;
+      else if (rodada[0] === '7️⃣') mult = 7;
+      else if (rodada[0] === '⭐') mult = 5;
+      else mult = 3;
+    } else if (rodada[0] === rodada[1] || rodada[1] === rodada[2] || rodada[0] === rodada[2]) {
+      mult = 1.5;
+    }
+    const ganho = mult > 0 ? Math.floor(qtd * mult) : 0;
+    if (ganho > 0) s.carteira += ganho - qtd;
+    else s.carteira -= qtd;
+    setSaldo(gid, uid, s);
+    const ganhou = ganho > 0;
+    const e = embedBase('🎰 Slot Machine', ganhou ? '#2ecc71' : '#e74c3c');
+    e.setDescription('┃ ' + rodada.join(' ┃ ') + ' ┃');
+    if (ganhou) {
+      e.addFields({ name: '✅ Ganhou! (x' + mult + ')', value: '🪙 +' + (ganho - qtd) });
+    } else {
+      e.addFields({ name: '❌ Perdeu!', value: '🪙 -' + qtd });
+    }
+    e.setFooter({ text: 'Carteira: 🪙 ' + s.carteira });
+    return msg.reply({ embeds: [e] });
+  }
+
+  // RANKING
+  if (cmd === 'top' || cmd === 'ranking') {
+    const gmap = economia.get(gid);
+    if (!gmap || gmap.size === 0) return msg.reply('Ninguém tem saldo ainda!');
+    const lista = Array.from(gmap.entries())
+      .map(function(e) { return { id: e[0], total: e[1].carteira + e[1].banco }; })
+      .sort(function(a,b) { return b.total - a.total; })
+      .slice(0, 10);
+    const e = embedBase('🏆 Ranking de Moedas', '#f1c40f');
+    const medalhas = ['🥇','🥈','🥉'];
+    const desc = lista.map(function(u, i) {
+      return (medalhas[i] || (i+1)+'.') + ' <@' + u.id + '> — 🪙 ' + u.total;
+    }).join('\n');
+    e.setDescription(desc);
+    return msg.reply({ embeds: [e] });
+  }
+
+  // ADMIN: editar moedas
+  if (cmd === 'addmoney' || cmd === 'delmoney' || cmd === 'setmoney') {
+    if (!isAdmin(uid)) return;
+    const alvo = msg.mentions.members.first();
+    if (!alvo) return msg.reply('Use: `$' + cmd + ' @user <valor>`');
+    const qtd = parseInt(args[1]);
+    if (!qtd) return msg.reply('Valor inválido!');
+    const s = getSaldo(gid, alvo.id);
+    if (cmd === 'addmoney') s.carteira += qtd;
+    else if (cmd === 'delmoney') s.carteira = Math.max(0, s.carteira - qtd);
+    else s.carteira = qtd;
+    setSaldo(gid, alvo.id, s);
+    return msg.reply('✅ Carteira de ' + alvo.toString() + ' atualizada! 🪙 ' + s.carteira);
+  }
+
+  // ADMIN: editar config
+  if (cmd === 'config') {
+    if (!isAdmin(uid)) return;
+    const chave = args[0];
+    const valor = parseFloat(args[1]);
+    if (!chave || isNaN(valor)) {
+      const desc = Object.entries(config).map(function(e) {
+        return '`' + e[0] + '`: ' + e[1];
+      }).join('\n');
+      const e = embedBase('⚙️ Configurações', '#3498db');
+      e.setDescription(desc);
+      e.setFooter({ text: 'Use: $config <chave> <valor>' });
+      return msg.reply({ embeds: [e] });
+    }
+    if (!(chave in config)) return msg.reply('Chave inválida!');
+    config[chave] = valor;
+    return msg.reply('✅ `' + chave + '` atualizado para `' + valor + '`');
+  }
+
+  // AJUDA
+  if (cmd === 'ajuda' || cmd === 'help') {
+    const e = embedBase('📖 Comandos — Prefixo: $', '#3498db');
+    e.addFields(
+      { name: '💰 Economia', value: '`$saldo` `$dep` `$sac` `$pagar @user <val>`' },
+      { name: '💼 Ganhar', value: '`$trabalhar`' },
+      { name: '🦹 Roubo', value: '`$roubar @user`' },
+      { name: '🎲 Apostas', value: '`$coc <cara/coroa> <val>`\n`$dado <val>`\n`$bj <val>`\n`$slot <val>`' },
+      { name: '🏆 Ranking', value: '`$top`' },
+      { name: '⚙️ Admin', value: '`$addmoney` `$delmoney` `$setmoney` `$config`' }
+    );
+    return msg.reply({ embeds: [e] });
+  }
 });
 
 client.login(process.env.TOKEN);
